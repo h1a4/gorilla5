@@ -146,10 +146,12 @@ def get_doc_chunks(
     chunks = [chunk.page_content for chunk in chunks]
     return chunks
 
-def generate_chunk_instructions(chat_completer: ChatCompleter, chunk: Any, x=5, model: str = None) -> list[str]:
+def generate_chunk_instructions(chat_completer: ChatCompleter, chunk: Any, x=5, model: str = None, prompt_key: str = None) -> list[str]:
     """
     Generates `x` questions / use cases for `api_call`. Used when the input document is of type `api`.
+    prompt_key 매개변수는 API 타입의 경우 무시되지만, 함수 인터페이스 일관성을 위해 추가
     """
+    # prompt_key 매개변수는 사용하지 않지만, 인터페이스 일관성을 위해 받아들임
     response = chat_completer(
         model=model,
         messages=[
