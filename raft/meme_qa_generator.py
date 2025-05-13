@@ -9,6 +9,8 @@ from client_utils import build_openai_client, ChatCompleter
 from tqdm import tqdm
 import logging
 import uuid
+import random
+
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -20,12 +22,51 @@ MODES = ['base', 'caption', 'both']
 
 # 카테고리 및 상세 설명
 CATEGORY_DESCRIPTIONS = {
-    "문화적 맥락 이해": "밈이 특정 문화적 배경이나 사회적 맥락 내에서 어떻게 해석되는지에 관한 질문을 생성하세요. 예: '이 밈은 어떤 문화적 현상을 참조하고 있나요?'",
-    "비유 및 상징 해석": "밈에 사용된 비유, 상징, 은유적 표현에 관한 질문을 생성하세요. 예: '이 밈에서 사용된 특정 이미지나 텍스트는 무엇을 상징하나요?'",
-    "풍자 및 아이러니 감지": "밈에 포함된 풍자, 아이러니, 반어법 등을 식별하는 질문을 생성하세요. 예: '이 밈에서 사용된 아이러니한 표현은 어떤 의미를 전달하나요?'",
-    "사회적 갈등 분석": "밈이 반영하는 사회적 갈등, 권력 구조, 계층 간 문제 등에 관한 질문을 생성하세요. 예: '이 밈은 어떤 사회적 갈등이나 이슈를 다루고 있나요?'",
-    "이미지-텍스트 통합 이해": "밈에서 이미지와 텍스트가 어떻게 상호작용하여 의미를 창출하는지에 관한 질문을 생성하세요. 예: '이 밈에서 이미지와 텍스트의 조합은 어떤 메시지를 전달하나요?'",
-    "맥락 기반 비판적 사고": "밈의 메시지나 의도를 비판적으로 분석하는 질문을 생성하세요. 예: '이 밈이 제시하는 관점이나 주장에 대한 반론은 무엇일 수 있나요?'"
+    "Understanding Cultural Context": [
+        "What cultural phenomenon does this meme reference?",
+        "Which era or generation's culture is reflected in this meme?",
+        "What is the social background that led to the popularity of this meme?",
+        "What shared experience or perception of a social group does this meme portray?",
+        "What cultural message does this meme convey?"
+    ],
+    "Metaphor and Symbol Interpretation": [
+        "What does the specific image or text in this meme symbolize?",
+        "What metaphorical meaning is conveyed through the expression in the meme?",
+        "What social message is delivered by the symbolic elements of this meme?",
+        "What does the visual composition of the meme symbolize?",
+        "What concept is expressed metaphorically in the core phrase of this meme?"
+    ],
+    "Detecting Satire and Irony": [
+        "In what way does this meme incorporate satirical elements?",
+        "What social phenomenon is being mocked through the expression in this meme?",
+        "What kind of irony is revealed in this meme?",
+        "What contradictory situation is being highlighted in this meme?",
+        "What is the social meaning behind the humor used in this meme?"
+    ],
+    "Analyzing Social Conflict": [
+        "What social conflict or tension is reflected in this meme?",
+        "Which social groups are in opposition in this meme?",
+        "What structural inequality is exposed by this meme?",
+        "How is this meme related to power dynamics or social status?",
+        "What ideological clash within society is expressed through this meme?"
+
+    ],
+    "Image-Text Integration": [
+        "How do the image and text in this meme complement each other's meaning?",
+        "What message is conveyed through the combination of image and text in this meme?",
+        "What is the relationship between the text and the image in this meme?",
+        "How does the meaning differ when the text is seen without the image?",
+        "How do the visual and linguistic elements interact in this meme?"
+
+    ],
+    "Context-Based Critical Thinking": [
+        "What social issue is this meme criticizing?",
+        "What potential counterarguments exist to the perspective shown in this meme?",
+        "What viewpoint does this meme present on a specific issue?",
+        "How does this meme encourage critical thinking in its audience?",
+        "What assumptions or biases are hidden within this meme?"
+
+    ]
 }
 
 # ---- PROMPT TEMPLATES ----
@@ -147,7 +188,8 @@ def generate_qa_for_entry(entry, captioner, chat_completer, model):
         return []
     
     results = []
-    for category, category_description in CATEGORY_DESCRIPTIONS.items():
+    for category, question_pool in CATEGORY_DESCRIPTIONS.items():
+        category_description = random.choice(question_pool)
         for mode in MODES:
             try:
                 # 모드별 처리

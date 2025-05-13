@@ -253,16 +253,30 @@ def encode_question(question: str, api: Any) -> list[str]:
     prompts.append({"role": "user", "content": prompt})
     return prompts
 
+# COT 유도 템플릿
 
 prompt_templates = {
     "gpt": """
-        Question: {question}\nContext: {context}\n
-        Answer this question using the information given in the context above. Here is things to pay attention to: 
-        - First provide step-by-step reasoning on how to answer the question. 
-        - In the reasoning, if you need to copy paste some sentences from the context, include them in ##begin_quote## and ##end_quote##. This would mean that things outside of ##begin_quote## and ##end_quote## are not directly copy paste from the context. 
-        - End your response with final answer in the form <ANSWER>: $answer, the answer should be succinct.
-        You MUST begin your final answer with the tag "<ANSWER>:".
-    """,
+        Question: {question}
+        Context: {context}
+
+        Answer this question using the information given in the context above.
+
+        Step-by-step instructions:
+        1. Begin by identifying a relevant sentence from the context that supports the answer. Copy it and wrap it with ##begin_quote## and ##end_quote##.
+        2. Explain why this quote is important and how it helps answer the question.
+        3. If necessary, use multiple quotes, and connect them logically.
+        4. Provide a short summary of your reasoning.
+        5. End your response with the final answer in the form <ANSWER>: $answer
+
+        Make sure to:
+        - Use clear, logical reasoning
+        - Only use information available in the context
+        - Start the final answer with "<ANSWER>:"
+    """
+    ,
+
+
     "llama": """
         Question: {question}
         Context: {context}
