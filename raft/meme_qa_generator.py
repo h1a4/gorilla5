@@ -254,7 +254,7 @@ def generate_qa_for_entry(entry, captioner, chat_completer, model):
                     ]
                 
                 # GPT 호출 - 모든 모드에서 같은 모델 사용
-                resp = chat_completer(model=model, messages=messages, max_tokens=512, temperature=0.7)
+                resp = chat_completer(model=model, messages=messages, max_tokens=1024, temperature=0.7)
                 
                 # 결과 처리
                 content = resp.choices[0].message.content.strip()
