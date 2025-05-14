@@ -1,5 +1,6 @@
 import json
 import argparse
+import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
@@ -10,17 +11,23 @@ from tqdm import tqdm
 import logging
 import uuid
 import random
+import math
+from collections import defaultdict
 
 
-# 로깅 설정
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---- 설정 ----
+# ---- Configuration ----
 MODEL_NAME = "nlpconnect/vit-gpt2-image-captioning"
 MODES = ['base', 'caption', 'both']
 
-# 카테고리 및 상세 설명
+# Distractor document ratios (automatically applied to all QA pairs)
+DISTRACTOR_RATIOS = [0, 20, 40, 60, 80, 100]
+NUM_DISTRACTORS = 3  # Default number of distractor documents
+
+# Category descriptions
 CATEGORY_DESCRIPTIONS = {
     "Understanding Cultural Context": [
         "What cultural phenomenon does this meme reference?",
@@ -78,60 +85,66 @@ SYSTEM_PROMPT = (
     "and mark the final answer as '<ANSWER>: X' where X is the correct option letter."
 )
 
-# 'base' 모드용 프롬프트 템플릿 (이미지 직접 전달 + 문서 텍스트)
+# 'base' mode prompt template (direct image analysis + document text)
 BASE_USER_PROMPT_TEMPLATE = """
-Context document:
-<DOCUMENT>{doc_text}</DOCUMENT>
+Context documents:
+{context_docs}
 
-밈 제목: {title}
-모드: base (이미지 직접 분석)
-키워드: {keyword}
+Meme title: {title}
+Mode: base (direct image analysis)
+Keyword: {keyword}
 
-질문 유형: {category}
-질문 유형 설명: {category_description}
+Question type: {category}
+Question type description: {category_description}
 
-제공된 이미지와 문서 텍스트를 분석하여, CoT 스타일로 **객관식 질문 하나**와 **답변**을 생성해 주세요.
-- 객관식 질문은 A, B, C, D 네 가지 선택지를 포함해야 합니다.
-- 추론 과정은 ##begin_reason## ... ##end_reason## 으로 감싸고,
-- 최종 답은 '<ANSWER>: X' 형식으로 제시하세요 (X는 A, B, C, D 중 하나).
+Analyze the provided image and document text to generate a CoT-style **multiple-choice question** and **answer**.
+- The multiple-choice question must include four options: A, B, C, D.
+- Wrap your reasoning process with ##begin_reason## ... ##end_reason##, and in your reasoning clearly explain which documents (oracle or distractor) are relevant to solving the question.
+- Present the final answer in the format '<ANSWER>: X' where X is one of A, B, C, D.
+
+Note: Among the provided documents, there may be "oracle documents" that help understand the meme and "distractor documents" that are not relevant.
 """
 
-# 'caption' 모드용 프롬프트 템플릿 (캡션 + 문서 텍스트)
+# 'caption' mode prompt template (caption + document text)
 CAPTION_USER_PROMPT_TEMPLATE = """
-Context document:
-<DOCUMENT>{doc_text}</DOCUMENT>
+Context documents:
+{context_docs}
 
-밈 제목: {title}
-모드: caption (이미지 캡션 활용)
-키워드: {keyword}
+Meme title: {title}
+Mode: caption (using image caption)
+Keyword: {keyword}
 
-이미지 캡션: {caption_text}
-질문 유형: {category}
-질문 유형 설명: {category_description}
+Image caption: {caption_text}
+Question type: {category}
+Question type description: {category_description}
 
-문서 텍스트와 이미지 캡션을 바탕으로, CoT 스타일로 **객관식 질문 하나**와 **답변**을 생성해 주세요.
-- 객관식 질문은 A, B, C, D 네 가지 선택지를 포함해야 합니다.
-- 추론 과정은 ##begin_reason## ... ##end_reason## 으로 감싸고,
-- 최종 답은 '<ANSWER>: X' 형식으로 제시하세요 (X는 A, B, C, D 중 하나).
+Based on the document text and image caption, generate a CoT-style **multiple-choice question** and **answer**.
+- The multiple-choice question must include four options: A, B, C, D.
+- Wrap your reasoning process with ##begin_reason## ... ##end_reason##, and in your reasoning clearly explain which documents (oracle or distractor) are relevant to solving the question.
+- Present the final answer in the format '<ANSWER>: X' where X is one of A, B, C, D.
+
+Note: Among the provided documents, there may be "oracle documents" that help understand the meme and "distractor documents" that are not relevant.
 """
 
-# 'both' 모드용 프롬프트 템플릿 (이미지 직접 전달 + 캡션 + 문서 텍스트)
+# 'both' mode prompt template (direct image + caption + document text)
 BOTH_USER_PROMPT_TEMPLATE = """
-Context document:
-<DOCUMENT>{doc_text}</DOCUMENT>
+Context documents:
+{context_docs}
 
-밈 제목: {title}
-모드: both (이미지 직접 분석 + 캡션 활용)
-키워드: {keyword}
+Meme title: {title}
+Mode: both (direct image analysis + caption)
+Keyword: {keyword}
 
-이미지 캡션: {caption_text}
-질문 유형: {category}
-질문 유형 설명: {category_description}
+Image caption: {caption_text}
+Question type: {category}
+Question type description: {category_description}
 
-제공된 이미지, 이미지 캡션, 그리고 문서 텍스트를 모두 분석하여, CoT 스타일로 **객관식 질문 하나**와 **답변**을 생성해 주세요.
-- 객관식 질문은 A, B, C, D 네 가지 선택지를 포함해야 합니다.
-- 추론 과정은 ##begin_reason## ... ##end_reason## 으로 감싸고,
-- 최종 답은 '<ANSWER>: X' 형식으로 제시하세요 (X는 A, B, C, D 중 하나).
+Analyze the provided image, image caption, and document text to generate a CoT-style **multiple-choice question** and **answer**.
+- The multiple-choice question must include four options: A, B, C, D.
+- Wrap your reasoning process with ##begin_reason## ... ##end_reason##, and in your reasoning clearly explain which documents (oracle or distractor) are relevant to solving the question.
+- Present the final answer in the format '<ANSWER>: X' where X is one of A, B, C, D.
+
+Note: Among the provided documents, there may be "oracle documents" that help understand the meme and "distractor documents" that are not relevant.
 """
 
 # ---- IMAGE CAPTIONING ----
@@ -148,200 +161,484 @@ class Captioner:
             output_ids = self.model.generate(pixel_values)
             return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         except Exception as e:
-            logger.error(f"이미지 캡션 생성 중 오류 발생: {e}")
-            return "이미지 캡션을 생성할 수 없습니다."
+            logger.error(f"Error generating image caption: {e}")
+            return "Unable to generate image caption."
 
-# 이미지를 Base64로 인코딩하는 함수
+# Function to encode image to Base64
 def encode_image_to_base64(image_path):
     try:
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
     except Exception as e:
-        logger.error(f"이미지 인코딩 중 오류 발생: {e}")
+        logger.error(f"Error encoding image: {e}")
         return None
 
 def get_args():
-    """명령줄 인수 파싱"""
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, required=True, help="입력 JSON 파일 경로")
-    parser.add_argument("--output", type=Path, default=Path("./qa_dataset.json"), help="출력 데이터셋 경로")
-    parser.add_argument("--openai_key", type=str, default=None, help="OpenAI API 키")
-    parser.add_argument("--model", type=str, default="gpt-4-mini", help="사용할 모델")
-    parser.add_argument("--workers", type=int, default=4, help="병렬 처리 워커 수")
+    parser.add_argument("--input", type=Path, required=True, help="Path to input JSON file")
+    parser.add_argument("--documents_root", type=Path, required=False, default=Path("./documents"),
+                        help="Root folder path containing category-specific distractor documents")
+    parser.add_argument("--output", type=Path, default=Path("./qa_dataset.json"), help="Path to output dataset")
+    parser.add_argument("--openai_key", type=str, default=None, help="OpenAI API key")
+    parser.add_argument("--model", type=str, default="gpt-4-mini", help="Model to use")
+    parser.add_argument("--workers", type=int, default=4, help="Number of worker threads")
     return parser.parse_args()
 
 def load_memes(file_path):
-    """JSON 파일에서 밈 데이터 로드"""
+    """Load meme data from JSON file"""
     with open(file_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def generate_qa_for_entry(entry, captioner, chat_completer, model):
-    """각 밈 항목에 대한 QA 쌍 생성"""
-    # 캡션 생성
-    caption_text = captioner.caption(entry['image_path'])
-    doc_text = entry['doc_text']
+def load_category_distractor_documents(root_folder, category):
+    """
+    Load distractor documents matching the given category.
+    Find documents in category-specific folders.
+    """
+    category_folder = root_folder / category
     
-    # 이미지 인코딩 (base와 both 모드에서 사용)
-    base64_image = encode_image_to_base64(entry['image_path'])
-    if not base64_image:
-        logger.error(f"밈 {entry['title']}의 이미지를 인코딩할 수 없습니다. 건너뜁니다.")
-        return []
+    # Use root folder if category folder doesn't exist
+    if not category_folder.exists():
+        logger.warning(f"No folder for category '{category}'. Using root folder.")
+        category_folder = root_folder
     
-    results = []
-    for category, question_pool in CATEGORY_DESCRIPTIONS.items():
-        category_description = random.choice(question_pool)
-        for mode in MODES:
-            try:
-                # 모드별 처리
-                if mode == 'base':
-                    # 'base' 모드: 이미지 직접 전달 + 문서 텍스트
-                    user_prompt = BASE_USER_PROMPT_TEMPLATE.format(
-                        doc_text=doc_text,
-                        title=entry['title'],
-                        keyword=entry['keyword'],
-                        category=category,
-                        category_description=category_description
-                    )
-                    
-                    # 이미지 + 텍스트
-                    messages = [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": user_prompt},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }}
-                        ]}
-                    ]
-                
-                elif mode == 'caption':
-                    # 'caption' 모드: 캡션 + 문서 텍스트
-                    user_prompt = CAPTION_USER_PROMPT_TEMPLATE.format(
-                        doc_text=doc_text,
-                        title=entry['title'],
-                        keyword=entry['keyword'],
-                        caption_text=caption_text,
-                        category=category,
-                        category_description=category_description
-                    )
-                    
-                    # 텍스트만
-                    messages = [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ]
-                
-                else:  # 'both' 모드
-                    # 'both' 모드: 이미지 직접 전달 + 캡션 + 문서 텍스트
-                    user_prompt = BOTH_USER_PROMPT_TEMPLATE.format(
-                        doc_text=doc_text,
-                        title=entry['title'],
-                        keyword=entry['keyword'],
-                        caption_text=caption_text,
-                        category=category,
-                        category_description=category_description
-                    )
-                    
-                    # 이미지 + 텍스트
-                    messages = [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": user_prompt},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }}
-                        ]}
-                    ]
-                
-                # GPT 호출 - 모든 모드에서 같은 모델 사용
-                resp = chat_completer(model=model, messages=messages, max_tokens=1024, temperature=0.7)
-                
-                # 결과 처리
-                content = resp.choices[0].message.content.strip()
-                
-                # <ANSWER>: 형식으로 답변 추출
-                parts = content.split('<ANSWER>:')
-                question_with_options = parts[0].strip()
-                answer = parts[1].strip() if len(parts) > 1 else ''
-                
-                # 추론 과정 추출
-                reason_parts = question_with_options.split('##begin_reason##')
-                question_part = reason_parts[0].strip()
-                reasoning = ""
-                if len(reason_parts) > 1 and '##end_reason##' in reason_parts[1]:
-                    reasoning = reason_parts[1].split('##end_reason##')[0].strip()
-                
-                # 결과 저장
-                results.append({
-                    "id": str(uuid.uuid4()),
-                    "title": entry['title'],
-                    "keyword": entry['keyword'],
-                    "image_path": entry['image_path'],
-                    "mode": mode,
-                    "category": category,
-                    "question_with_options": question_part,
-                    "reasoning": reasoning,
-                    "cot_answer": "<ANSWER>: " + answer,
-                    "doc_text": doc_text,
-                    "caption": caption_text
+    distractor_docs = []
+    
+    # Find .txt files
+    txt_files = list(category_folder.glob('*.txt'))
+    if not txt_files:
+        txt_files = list(category_folder.glob('**/*.txt'))
+    
+    for file_path in txt_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                distractor_docs.append({
+                    'path': str(file_path),
+                    'content': content,
+                    'category': category
                 })
-                
-                logger.info(f"밈 '{entry['title']}' 모드 '{mode}' 카테고리 '{category}'에 대한 QA 생성 완료")
-                
-            except Exception as e:
-                logger.error(f"밈 {entry['title']} 처리 중 오류 발생 (모드: {mode}, 카테고리: {category}): {e}")
+        except Exception as e:
+            logger.error(f"Error loading text file '{file_path}': {e}")
     
-    return results
+    logger.info(f"Loaded {len(distractor_docs)} distractor documents for category '{category}'")
+    return distractor_docs
+
+def ensure_equal_context_length(docs, target_length=None):
+    """
+    Ensure all document contexts have equal length
+    Adjust all document lengths to match the longest document
+    """
+    if not docs:
+        return docs
+    
+    # Use the longest document if target length not specified
+    if target_length is None:
+        max_length = max(len(doc['content']) for doc in docs)
+        target_length = max_length
+    
+    adjusted_docs = []
+    for doc in docs:
+        content = doc['content']
+        # Pad with spaces if shorter
+        if len(content) < target_length:
+            padding = ' ' * (target_length - len(content))
+            content = content + padding
+        # Truncate if longer
+        elif len(content) > target_length:
+            content = content[:target_length]
+        
+        doc_copy = doc.copy()
+        doc_copy['content'] = content
+        adjusted_docs.append(doc_copy)
+    
+    return adjusted_docs
+
+def prepare_context_documents(oracle_doc, distractor_docs, has_oracle=True):
+    """
+    Prepare context documents (based on exact oracle inclusion)
+    
+    has_oracle: True to include oracle document, False to exclude
+    """
+    context_docs = []
+    total_docs_count = NUM_DISTRACTORS + 1
+    
+    if len(distractor_docs) < NUM_DISTRACTORS:
+        logger.warning(f"Not enough distractor documents. Needed: {NUM_DISTRACTORS}, Available: {len(distractor_docs)}")
+        if len(distractor_docs) == 0:
+            # Fill all with dummy documents if no distractors available
+            context_docs.append({
+                'id': 0,
+                'is_oracle': has_oracle,
+                'content': oracle_doc if has_oracle else "This document is a distractor document not needed for analysis."
+            })
+            
+            for i in range(1, total_docs_count):
+                context_docs.append({
+                    'id': i,
+                    'is_oracle': False,
+                    'content': f"This document is a distractor document not needed for analysis. Document ID: {i}"
+                })
+            
+            # Format documents
+            formatted_docs = ""
+            for i, doc in enumerate(context_docs):
+                formatted_docs += f"<DOCUMENT id={i}>\n{doc['content']}\n</DOCUMENT>\n\n"
+            
+            return {
+                'formatted_docs': formatted_docs,
+                'docs': context_docs,
+                'has_oracle': has_oracle
+            }
+    
+    # Process based on oracle inclusion flag
+    if has_oracle:
+        # Include oracle document
+        context_docs.append({
+            'id': 0,
+            'is_oracle': True,
+            'content': oracle_doc
+        })
+        
+        # Add distractor documents
+        distractors_needed = total_docs_count - 1
+        selected_distractors = random.sample(distractor_docs, min(distractors_needed, len(distractor_docs)))
+        for i, doc in enumerate(selected_distractors):
+            context_docs.append({
+                'id': i + 1,
+                'is_oracle': False,
+                'content': doc['content']
+            })
+    else:
+        # Exclude oracle document, use only distractors
+        selected_distractors = random.sample(distractor_docs, min(total_docs_count, len(distractor_docs)))
+        for i, doc in enumerate(selected_distractors):
+            context_docs.append({
+                'id': i,
+                'is_oracle': False,
+                'content': doc['content']
+            })
+    
+    # Fill with dummy documents if not enough distractors
+    while len(context_docs) < total_docs_count:
+        context_docs.append({
+            'id': len(context_docs),
+            'is_oracle': False,
+            'content': f"This document is a distractor document not needed for analysis. Document ID: {len(context_docs)}"
+        })
+    
+    # Ensure equal document lengths
+    context_docs = ensure_equal_context_length(context_docs)
+    
+    # Shuffle document order
+    random.shuffle(context_docs)
+    
+    # Format documents
+    formatted_docs = ""
+    for i, doc in enumerate(context_docs):
+        formatted_docs += f"<DOCUMENT id={i}>\n{doc['content']}\n</DOCUMENT>\n\n"
+    
+    return {
+        'formatted_docs': formatted_docs,
+        'docs': context_docs,
+        'has_oracle': has_oracle
+    }
+
+def prepare_oracle_distribution(memes, category_docs_mapping):
+    """
+    Pre-determine oracle document inclusion with exact ratios
+    
+    returns: {ratio: {category: {mode: {'entries': [entry list], 'has_oracle': [True/False list]}}}}
+    """
+    # Group memes by category and mode
+    category_mode_memes = defaultdict(lambda: defaultdict(list))
+    
+    for meme in memes:
+        for category in CATEGORY_DESCRIPTIONS.keys():
+            if category in category_docs_mapping and category_docs_mapping[category]:
+                for mode in MODES:
+                    category_mode_memes[category][mode].append(meme)
+    
+    # Determine oracle inclusion for each ratio
+    oracle_distribution = {}
+    
+    for ratio in DISTRACTOR_RATIOS:
+        oracle_distribution[ratio] = {}
+        
+        for category, mode_memes in category_mode_memes.items():
+            oracle_distribution[ratio][category] = {}
+            
+            for mode, entries in mode_memes.items():
+                num_entries = len(entries)
+                
+                if ratio == 0:
+                    # 0% ratio: include Oracle in all items
+                    has_oracle = [True] * num_entries
+                elif ratio == 100:
+                    # 100% ratio: exclude Oracle from all items
+                    has_oracle = [False] * num_entries
+                else:
+                    # Middle ratios: exclude Oracle from ratio% of items
+                    num_without_oracle = int(num_entries * (ratio / 100))
+                    has_oracle = [True] * num_entries
+                    
+                    # Randomly select items to exclude Oracle
+                    indices_without_oracle = random.sample(range(num_entries), num_without_oracle)
+                    for idx in indices_without_oracle:
+                        has_oracle[idx] = False
+                
+                oracle_distribution[ratio][category][mode] = {
+                    'entries': entries,
+                    'has_oracle': has_oracle
+                }
+    
+    return oracle_distribution
+
+def generate_qa_for_entry(entry, captioner, chat_completer, model, category_docs_mapping, oracle_distribution=None):
+    """
+    Generate QA pairs for each meme entry
+    
+    oracle_distribution: oracle inclusion information in the format {ratio: {category: {mode: [has_oracle list]}}}
+    """
+    try:
+        # Generate caption
+        caption_text = captioner.caption(entry['image_path'])
+        oracle_doc = entry['doc_text']
+        
+        # Encode image (for base and both modes)
+        base64_image = encode_image_to_base64(entry['image_path'])
+        if not base64_image:
+            logger.error(f"Cannot encode image for meme {entry['title']}. Skipping.")
+            return []
+        
+        results = []
+        for category, question_pool in CATEGORY_DESCRIPTIONS.items():
+            category_description = random.choice(question_pool)
+            
+            # Get distractor documents for this category
+            distractor_docs = category_docs_mapping.get(category, [])
+            if not distractor_docs:
+                logger.warning(f"No distractor documents for category '{category}'")
+                continue
+            
+            for mode in MODES:
+                for ratio in DISTRACTOR_RATIOS:
+                    # Check oracle inclusion
+                    has_oracle = True  # Default value
+                    if oracle_distribution and ratio in oracle_distribution:
+                        if category in oracle_distribution[ratio]:
+                            if mode in oracle_distribution[ratio][category]:
+                                # Find the current entry's index and check oracle inclusion
+                                entry_idx = oracle_distribution[ratio][category][mode]['entries'].index(entry)
+                                has_oracle = oracle_distribution[ratio][category][mode]['has_oracle'][entry_idx]
+                    
+                    # Prepare context documents according to ratio
+                    context_data = prepare_context_documents(
+                        oracle_doc, 
+                        distractor_docs,
+                        has_oracle=has_oracle
+                    )
+                    
+                    try:
+                        # Process by mode
+                        if mode == 'base':
+                            # 'base' mode: direct image + document text
+                            user_prompt = BASE_USER_PROMPT_TEMPLATE.format(
+                                context_docs=context_data['formatted_docs'],
+                                title=entry['title'],
+                                keyword=entry['keyword'],
+                                category=category,
+                                category_description=category_description
+                            )
+                            
+                            # Image + text
+                            messages = [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": [
+                                    {"type": "text", "text": user_prompt},
+                                    {"type": "image_url", "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }}
+                                ]}
+                            ]
+                        
+                        elif mode == 'caption':
+                            # 'caption' mode: caption + document text
+                            user_prompt = CAPTION_USER_PROMPT_TEMPLATE.format(
+                                context_docs=context_data['formatted_docs'],
+                                title=entry['title'],
+                                keyword=entry['keyword'],
+                                caption_text=caption_text,
+                                category=category,
+                                category_description=category_description
+                            )
+                            
+                            # Text only
+                            messages = [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": user_prompt}
+                            ]
+                        
+                        else:  # 'both' mode
+                            # 'both' mode: direct image + caption + document text
+                            user_prompt = BOTH_USER_PROMPT_TEMPLATE.format(
+                                context_docs=context_data['formatted_docs'],
+                                title=entry['title'],
+                                keyword=entry['keyword'],
+                                caption_text=caption_text,
+                                category=category,
+                                category_description=category_description
+                            )
+                            
+                            # Image + text
+                            messages = [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": [
+                                    {"type": "text", "text": user_prompt},
+                                    {"type": "image_url", "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }}
+                                ]}
+                            ]
+                        
+                        # GPT call - same model for all modes
+                        resp = chat_completer(model=model, messages=messages, max_tokens=1024, temperature=0.7)
+                        
+                        # Process results
+                        content = resp.choices[0].message.content.strip()
+                        
+                        # Extract answer in <ANSWER>: format
+                        parts = content.split('<ANSWER>:')
+                        question_with_options = parts[0].strip()
+                        answer = parts[1].strip() if len(parts) > 1 else ''
+                        
+                        # Extract reasoning process
+                        reason_parts = question_with_options.split('##begin_reason##')
+                        question_part = reason_parts[0].strip()
+                        reasoning = ""
+                        if len(reason_parts) > 1 and '##end_reason##' in reason_parts[1]:
+                            reasoning = reason_parts[1].split('##end_reason##')[0].strip()
+                        
+                        # Save results
+                        results.append({
+                            "id": str(uuid.uuid4()),
+                            "title": entry['title'],
+                            "keyword": entry['keyword'],
+                            "image_path": entry['image_path'],
+                            "mode": mode,
+                            "category": category,
+                            "distractor_ratio": ratio,
+                            "has_oracle": context_data['has_oracle'],
+                            "question_with_options": question_part,
+                            "reasoning": reasoning,
+                            "cot_answer": "<ANSWER>: " + answer,
+                            "oracle_doc": oracle_doc,
+                            "context_docs": context_data['docs'],
+                            "caption": caption_text
+                        })
+                        
+                        logger.info(f"Completed QA generation for meme '{entry['title']}' mode '{mode}' category '{category}' distractor ratio '{ratio}%'")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing meme {entry['title']} (mode: {mode}, category: {category}, ratio: {ratio}%): {e}")
+    
+        return results
+    except Exception as e:
+        logger.error(f"Error processing meme {entry.get('title', 'unknown')}: {e}")
+        return []
 
 def main():
-    """메인 실행 함수"""
+    """Main execution function"""
     args = get_args()
     
-    # OpenAI 클라이언트 및 캡셔너 설정
+    # Set up OpenAI client and captioner
     openai_client = build_openai_client(api_key=args.openai_key)
     chat_completer = ChatCompleter(openai_client)
     captioner = Captioner()
     
-    # 밈 데이터 로드
+    # Load meme data
     memes = load_memes(args.input)
-    logger.info(f"{len(memes)}개의 밈 데이터를 로드했습니다.")
+    logger.info(f"Loaded {len(memes)} meme entries")
     
-    # 밈별로 QA 쌍 생성
+    # Check if documents_root exists
+    if not args.documents_root.exists():
+        logger.warning(f"Documents root folder {args.documents_root} does not exist. Creating dummy documents.")
+        os.makedirs(args.documents_root, exist_ok=True)
+    
+    # Load category-specific distractor documents
+    category_docs_mapping = {}
+    for category in CATEGORY_DESCRIPTIONS.keys():
+        category_docs = load_category_distractor_documents(args.documents_root, category)
+        # If no documents found, create dummy documents
+        if not category_docs:
+            logger.warning(f"No documents found for category {category}. Creating dummy documents.")
+            category_docs = [
+                {
+                    'path': f"dummy_{category}_{i}.txt",
+                    'content': f"This is a dummy distractor document for category {category}. Document ID: {i}",
+                    'category': category
+                } for i in range(NUM_DISTRACTORS * 2)  # Create enough dummy documents
+            ]
+        category_docs_mapping[category] = category_docs
+    
+    total_docs = sum(len(docs) for docs in category_docs_mapping.values())
+    logger.info(f"Loaded {total_docs} distractor documents across {len(category_docs_mapping)} categories")
+    
+    # Pre-determine oracle document inclusion with exact ratios
+    oracle_distribution = prepare_oracle_distribution(memes, category_docs_mapping)
+    logger.info("Determined oracle document inclusion ratios")
+    
+    # Generate QA pairs for each meme
     dataset = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
-            executor.submit(generate_qa_for_entry, meme, captioner, chat_completer, args.model)
+            executor.submit(generate_qa_for_entry, meme, captioner, chat_completer, 
+                           args.model, category_docs_mapping, oracle_distribution)
             for meme in memes
         ]
         
-        with tqdm(total=len(futures), desc="밈 QA 생성") as pbar:
+        with tqdm(total=len(futures), desc="Generating meme QA pairs") as pbar:
             for future in as_completed(futures):
                 try:
                     results = future.result()
                     dataset.extend(results)
                     pbar.update(1)
-                    pbar.set_postfix({'QA 쌍': len(dataset)})
+                    pbar.set_postfix({'QA pairs': len(dataset)})
                 except Exception as e:
-                    logger.error(f"QA 생성 중 오류 발생: {e}")
+                    logger.error(f"Error generating QA: {e}")
     
-    logger.info(f"총 {len(dataset)}개의 QA 쌍을 생성했습니다.")
+    logger.info(f"Generated {len(dataset)} QA pairs total")
     
-    # 데이터셋 저장
+    # Save dataset files for each ratio
+    output_dir = args.output.parent
+    for ratio in DISTRACTOR_RATIOS:
+        ratio_dataset = [item for item in dataset if item['distractor_ratio'] == ratio]
+        if ratio_dataset:
+            output_path = args.output.with_name(f"{args.output.stem}_ratio_{ratio}{args.output.suffix}")
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(ratio_dataset, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {len(ratio_dataset)} items with distractor ratio {ratio}% to {output_path}")
+    
+    # Save complete dataset
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(dataset, f, ensure_ascii=False, indent=2)
     
-    logger.info(f"데이터셋이 {args.output}에 저장되었습니다.")
+    logger.info(f"Saved complete dataset to {args.output}")
     
-    # 통계 정보 출력
+    # Output statistics
     modes_count = {mode: sum(1 for item in dataset if item['mode'] == mode) for mode in MODES}
     categories_count = {cat: sum(1 for item in dataset if item['category'] == cat) for cat in CATEGORY_DESCRIPTIONS.keys()}
+    ratios_count = {ratio: sum(1 for item in dataset if item['distractor_ratio'] == ratio) for ratio in DISTRACTOR_RATIOS}
+    oracle_count = sum(1 for item in dataset if item['has_oracle'])
     
-    logger.info("===== 생성된 QA 쌍 통계 =====")
-    logger.info(f"총 밈 수: {len(memes)}")
-    logger.info(f"총 QA 쌍 수: {len(dataset)}")
-    logger.info(f"밈당 평균 QA 쌍 수: {len(dataset)/len(memes):.2f}")
-    logger.info(f"모드별 분포: {modes_count}")
-    logger.info(f"카테고리별 분포: {categories_count}")
+    logger.info("===== Generated QA Pair Statistics =====")
+    logger.info(f"Total memes: {len(memes)}")
+    logger.info(f"Total QA pairs: {len(dataset)}")
+    logger.info(f"Average QA pairs per meme: {len(dataset)/len(memes):.2f}")
+    logger.info(f"Mode distribution: {modes_count}")
+    logger.info(f"Category distribution: {categories_count}")
+    logger.info(f"Distractor ratio distribution: {ratios_count}")
+    logger.info(f"Oracle document inclusion: {oracle_count} ({oracle_count/len(dataset)*100:.2f}%)")
 
 if __name__ == "__main__":
     main()
