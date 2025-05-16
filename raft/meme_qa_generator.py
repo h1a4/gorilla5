@@ -190,36 +190,97 @@ def load_memes(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def load_category_distractor_documents(root_folder, category):
+def load_category_distractor_documents(root_folder, category, all_documents=None):
     """
     Load distractor documents matching the given category.
-    Find documents in category-specific folders.
+    If not enough category-specific documents found, use documents from other categories.
+    
+    Parameters:
+    - root_folder: 문서 폴더의 루트 경로
+    - category: 현재 카테고리
+    - all_documents: 모든 카테고리의 문서를 담은 딕셔너리 (다른 카테고리 문서 활용 시 사용)
     """
     category_folder = root_folder / category
     
-    # Use root folder if category folder doesn't exist
-    if not category_folder.exists():
-        logger.warning(f"No folder for category '{category}'. Using root folder.")
-        category_folder = root_folder
-    
     distractor_docs = []
     
-    # Find .txt files
-    txt_files = list(category_folder.glob('*.txt'))
-    if not txt_files:
-        txt_files = list(category_folder.glob('**/*.txt'))
+    # 1단계: 해당 카테고리 폴더에서 문서 찾기
+    if category_folder.exists():
+        txt_files = list(category_folder.glob('*.txt'))
+        if not txt_files:
+            txt_files = list(category_folder.glob('**/*.txt'))
+        
+        for file_path in txt_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    distractor_docs.append({
+                        'path': str(file_path),
+                        'content': content,
+                        'category': category
+                    })
+            except Exception as e:
+                logger.error(f"Error loading text file '{file_path}': {e}")
     
-    for file_path in txt_files:
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                distractor_docs.append({
-                    'path': str(file_path),
-                    'content': content,
-                    'category': category
-                })
-        except Exception as e:
-            logger.error(f"Error loading text file '{file_path}': {e}")
+    # 2단계: 카테고리 폴더가 없거나 파일이 부족하면 루트 폴더에서 문서 찾기
+    elif len(distractor_docs) < NUM_DISTRACTORS :
+        logger.info(f"Not enough documents in category '{category}' folder. Looking in root folder.")
+        
+        # 루트 폴더의 모든 .txt 파일 찾기 (하위 폴더 포함)
+        root_txt_files = [f for f in root_folder.glob('**/*.txt') 
+                          if category not in str(f) or not f.is_file()]  # 현재 카테고리 폴더 제외
+        
+        for file_path in root_txt_files:
+            if len(distractor_docs) >= NUM_DISTRACTORS :  # 충분한 문서를 찾았으면 중단
+                break
+                
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # 이미 추가된 파일인지 확인
+                    if not any(doc['path'] == str(file_path) for doc in distractor_docs):
+                        distractor_docs.append({
+                            'path': str(file_path),
+                            'content': content,
+                            'category': 'general'  # 일반 카테고리로 표시
+                        })
+            except Exception as e:
+                logger.error(f"Error loading root text file '{file_path}': {e}")
+    
+    # 3단계: 다른 카테고리의 문서 활용 (여전히 부족한 경우)
+    elif len(distractor_docs) < NUM_DISTRACTORS * 1 and all_documents:
+        logger.info(f"Still not enough documents for '{category}'. Using documents from other categories.")
+        
+        # 다른 카테고리의 모든 문서 수집
+        other_docs = []
+        for other_cat, docs in all_documents.items():
+            if other_cat != category:
+                other_docs.extend(docs)
+        
+        # 무작위로 선택하여 추가
+        if other_docs:
+            random.shuffle(other_docs)
+            for doc in other_docs:
+                if len(distractor_docs) >= NUM_DISTRACTORS :  # 충분한 문서를 찾았으면 중단
+                    break
+                    
+                # 이미 추가된 파일인지 확인
+                if not any(d['path'] == doc['path'] for d in distractor_docs):
+                    distractor_docs.append(doc)
+    
+    # 4단계: 그래도 부족하면 더미 문서 생성
+    else:
+        logger.warning(f"Still not enough documents for '{category}'. Creating fictional race meme dummy documents.")
+        
+        needed = NUM_DISTRACTORS * 2 - len(distractor_docs)
+        for i in range(needed):
+            # 허위 인종 밈 더미 문서에서 랜덤하게 선택
+            random_content = random.choice(RACE_MEME_DUMMY_DOCS)
+            distractor_docs.append({
+                'path': f"dummy_{category}_{i}.txt",
+                'content': f"{random_content} [Document ID: {i}]",
+                'category': category
+            })
     
     logger.info(f"Loaded {len(distractor_docs)} distractor documents for category '{category}'")
     return distractor_docs
@@ -320,12 +381,28 @@ def prepare_context_documents(oracle_doc, distractor_docs, has_oracle=True):
             })
     
     # Fill with dummy documents if not enough distractors
-    while len(context_docs) < total_docs_count:
-        context_docs.append({
-            'id': len(context_docs),
-            'is_oracle': False,
-            'content': f"This document is a distractor document not needed for analysis. Document ID: {len(context_docs)}"
-        })
+    while len(context_docs) < total_docs_count and len(distractor_docs) > 0:
+        # 이미 사용하지 않은 문서 중에서 무작위로 선택
+        used_paths = [doc.get('path', '') for doc in context_docs if 'path' in doc]
+        unused_docs = [doc for doc in distractor_docs if doc['path'] not in used_paths]
+        
+        if unused_docs:
+            selected_doc = random.choice(unused_docs)
+            context_docs.append({
+                'id': len(context_docs),
+                'is_oracle': False,
+                'content': selected_doc['content'],
+                'path': selected_doc['path']
+            })
+        else:
+            # 사용 가능한 문서가 더 이상 없으면 기존 방식으로 더미 문서 생성
+            random_content = random.choice(RACE_MEME_DUMMY_DOCS)
+            doc_id = len(context_docs)
+            context_docs.append({
+                'id': doc_id,
+                'is_oracle': False,
+                'content': f"{random_content} [Document ID: {doc_id}]"
+            })
     
     # Ensure equal document lengths
     context_docs = ensure_equal_context_length(context_docs)
@@ -565,21 +642,19 @@ def main():
         logger.warning(f"Documents root folder {args.documents_root} does not exist. Creating dummy documents.")
         os.makedirs(args.documents_root, exist_ok=True)
     
-    # Load category-specific distractor documents
     category_docs_mapping = {}
+    all_documents = {}
+    # 1단계: 각 카테고리 폴더에서 문서 로드 (아직 다른 카테고리 문서 활용 안 함)
     for category in CATEGORY_DESCRIPTIONS.keys():
         category_docs = load_category_distractor_documents(args.documents_root, category)
-        # If no documents found, create dummy documents
-        if not category_docs:
-            logger.warning(f"No documents found for category {category}. Creating dummy documents.")
-            category_docs = [
-                {
-                    'path': f"dummy_{category}_{i}.txt",
-                    'content': f"This is a dummy distractor document for category {category}. Document ID: {i}",
-                    'category': category
-                } for i in range(NUM_DISTRACTORS * 2)  # Create enough dummy documents
-            ]
-        category_docs_mapping[category] = category_docs
+        all_documents[category] = category_docs
+    # 2단계: 부족한 카테고리는 다른 카테고리 문서도 활용하여 다시 로드
+    for category in CATEGORY_DESCRIPTIONS.keys():
+        if len(all_documents[category]) < NUM_DISTRACTORS * 2:
+            category_docs = load_category_distractor_documents(args.documents_root, category, all_documents)
+            category_docs_mapping[category] = category_docs
+        else:
+            category_docs_mapping[category] = all_documents[category]
     
     total_docs = sum(len(docs) for docs in category_docs_mapping.values())
     logger.info(f"Loaded {total_docs} distractor documents across {len(category_docs_mapping)} categories")
@@ -608,22 +683,32 @@ def main():
                     logger.error(f"Error generating QA: {e}")
     
     logger.info(f"Generated {len(dataset)} QA pairs total")
+
+    def clean_padding_spaces(dataset_items):
+        for item in dataset_items:
+            if 'context_docs' in item:
+                for doc in item['context_docs']:
+                    if 'content' in doc:
+                        doc['content'] = doc['content'].rstrip()
+        return dataset_items
+
+    logger.info(f"Generated {len(dataset)} QA pairs total")
+    dataset = clean_padding_spaces(dataset)
     
     # Save dataset files for each ratio
+    folder_name = args.documents_root.name
     output_dir = args.output.parent
     for ratio in DISTRACTOR_RATIOS:
         ratio_dataset = [item for item in dataset if item['distractor_ratio'] == ratio]
         if ratio_dataset:
-            output_path = args.output.with_name(f"{args.output.stem}_ratio_{ratio}{args.output.suffix}")
+            output_path = args.output.with_name(f"{args.output.stem}_{folder_name}_ratio_{ratio}{args.output.suffix}")
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(ratio_dataset, f, ensure_ascii=False, indent=2)
             logger.info(f"Saved {len(ratio_dataset)} items with distractor ratio {ratio}% to {output_path}")
-    
-    # Save complete dataset
-    with open(args.output, 'w', encoding='utf-8') as f:
+
+    with open(args.output.with_name(f"{args.output.stem}_{folder_name}{args.output.suffix}"), 'w', encoding='utf-8') as f:
         json.dump(dataset, f, ensure_ascii=False, indent=2)
-    
-    logger.info(f"Saved complete dataset to {args.output}")
+    logger.info(f"Saved complete dataset to {args.output.with_name(f'{args.output.stem}_{folder_name}{args.output.suffix}')}")
     
     # Output statistics
     modes_count = {mode: sum(1 for item in dataset if item['mode'] == mode) for mode in MODES}
